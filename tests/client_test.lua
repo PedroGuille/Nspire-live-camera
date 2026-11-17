@@ -51,9 +51,12 @@ on.charIn('p'); assert(writes[#writes]=='PIC\n')
 on.charIn('f'); assert(writes[#writes]=='FLASH\n')
 -- Real ASI writes complete asynchronously: SIZE must finish before STREAM.
 deferred = true
-on.tabKey(); assert(writes[#writes]=='SIZE 72\n')
+on.tabKey(); assert(writes[#writes]=='WINDOW 2\n')
 local before = #writes
 on.timer(); assert(#writes==before)
+writeListener(port); assert(writes[#writes]=='FORMAT 64\n')
+writeListener(port); assert(writes[#writes]=='NOISE 8\n')
+writeListener(port); assert(writes[#writes]=='SIZE 51\n')
 writeListener(port); assert(writes[#writes]=='STREAM\n')
 writeListener(port)
 local originalWrite = port.write
@@ -66,5 +69,6 @@ on.charIn('f'); before=#writes
 on.timer(); assert(#writes==before+1 and writes[#writes]=='FLASH\n')
 writeListener(port)
 deferred = false
+on.charIn('t'); assert(writes[#writes]=='METRICS 1\n'); on.paint(gc)
 on.destroy(); assert(not connected)
 print('TI client mock tests passed: connection, valid timeout/baud, one read in flight, stream, rendering, stop and photo')

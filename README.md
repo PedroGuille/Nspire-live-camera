@@ -9,16 +9,16 @@ implementation, not measured performance of NC2.
 
 ## What changed
 
-- **256-colour RGB332** instead of the old custom 36-colour palette. Neutral sensor
+- **256-colour RGB332 quality option** instead of the old custom 36-colour palette. Neutral sensor
   settings and proper RGB565 channel expansion avoid the old clipped colour boosts.
-- **51×51, 72×72 and 102×102 output**, selected from the calculator. 72×72 is the
-  default; 102×102 has four times as many pixels as the original 51×51 stream.
+- **51×51, 72×72 and 102×102 output**, selected from the calculator. 51×51 is the
+  fast default; 102×102 has four times as many pixels as the original 51×51 stream.
 - Exact box downsampling covers the full centre crop, including the bottom/right
   pixels previously lost to integer truncation. Capture uses QVGA rather than VGA.
 - Adaptive raw, PackBits, compact palette, or XOR-delta compression. The shortest
   payload wins, and compression never exceeds raw RGB332. Deltas preserve every
   changed pixel after colour quantisation.
-- **Acknowledged 192-character chunks**, bounded retries and whole-frame checksums
+- **Acknowledged 192-character chunks in bounded bursts**, bounded retries and whole-frame checksums
   replace guessed 50 ms chunk sleeps and a 200 ms frame delay. The calculator
   controls how quickly the next packet is sent.
 - Frames are decoded once and horizontal render runs are cached. Pixels have no
@@ -61,7 +61,7 @@ legacy stub; this firmware needs no network credentials or ArduinoJson library.
    **P** takes a photo, **Esc** stops, **F** toggles the flash. These actions are
    also available from Menu → Camera. The last complete image stays on screen.
 
-If the ESP reports `ack-timeout`, it stops the camera after three retries; press
+If the ESP reports `ack-timeout`, it stops the camera in snapshot mode after three retries; press
 Tab to start again. A reconnect or restart clears delta references automatically.
 Camera initialization/capture errors appear in the calculator's status line.
 
@@ -116,3 +116,22 @@ costs bandwidth and render time. Actual speed, colour appearance, power stabilit
 and sensor byte order still need testing on a physical CX + ESP32-CAM setup.
 
 See [docs/PROTOCOL.md](docs/PROTOCOL.md) for framing, bounds and recovery details.
+
+## Low-lag defaults (latest update)
+
+The default is now **51×51, 64 colours**, two chunks per acknowledgement and
+noise hysteresis enabled. Menu → Colours offers 16-shade grayscale and the
+original 256-colour quality mode; Menu → Quality still selects resolution.
+Menu → Noise → Exact pixels disables temporal filtering. That filter reduces
+small sensor fluctuations, at the cost of delaying subtle changes.
+
+Live mode drops stalled/overdue frames and captures fresh ones instead of
+retrying old pictures. Snapshots retain reliable retries. A prolonged link failure
+stops the camera after eight consecutive dropped frames. The last complete image
+remains visible; Tab restarts streaming. Higher resolutions still cost latency.
+
+Press **T** (or Menu → Diagnostics) for measured stage timings: capture,
+processing, transfer/ACK, Lua decode, cache preparation, drawing, and dropped
+frames. Transfer includes receiver decode/cache, so the displayed stage times
+are not all additive. No smooth-video/FPS claim has been measured on hardware.
+See the low-lag protocol extension for timeout and packet bounds.

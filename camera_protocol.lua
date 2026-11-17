@@ -106,7 +106,7 @@ local Receiver = {}
 Receiver.__index = Receiver
 function M.new(send, frame, status)
     return setmetatable({send = send, frame = frame, status = status or function() end,
-        line = "", dropping = false, current = nil, previous = nil, lastSequence = 0}, Receiver)
+        window = 1, clock = function() return 0 end, decodeMs = 0, line = "", dropping = false, current = nil, previous = nil, lastSequence = 0}, Receiver)
 end
 
 function Receiver:reset()
@@ -126,12 +126,13 @@ local function validSequence(seq)
 end
 
 function Receiver:process(line)
-    local s, base, w, h, mode, length, checksum = line:match(
-        "^NC2 BEGIN (%d+) (%d+) (%d+) (%d+) ([KRDP]) (%d+) (%d+)$")
+    local s, base, w, h, mode, length, checksum, suffix = line:match(
+        "^NC2 BEGIN (%d+) (%d+) (%d+) (%d+) ([KRDP]) (%d+) (%d+)(.*)$")
     if s then
+        local profile = suffix == '' and 256 or tonumber(suffix:match('^ (%d+)$'))
         s, base, w, h = tonumber(s), tonumber(base), tonumber(w), tonumber(h)
         length, checksum = tonumber(length), tonumber(checksum)
-        if not validSequence(s) or base > 4294967295 or w < 1 or w > MAX_SIDE or h ~= w or
+        if (profile~=16 and profile~=64 and profile~=256) or not validSequence(s) or base > 4294967295 or w < 1 or w > MAX_SIDE or h ~= w or
            length < 4 or length > 4 * math.ceil(w * h / 3) or length % 4 ~= 0 or
            checksum > 4294967295 or (mode ~= 'D' and base ~= 0) then
             self:reject("header", validSequence(s) and s or nil)
@@ -140,17 +141,17 @@ function Receiver:process(line)
         if s == self.lastSequence then return end -- first packet/DONE acknowledgement retry
         local c = self.current
         if c and c.seq == s then
-            if c.base ~= base or c.w ~= w or c.mode ~= mode or c.length ~= length or c.checksum ~= checksum then
+            if c.profile ~= profile or c.base ~= base or c.w ~= w or c.mode ~= mode or c.length ~= length or c.checksum ~= checksum then
                 self:reject("conflicting header")
             end
             return
         end
         if mode == 'D' and (not self.previous or base ~= self.lastSequence or
-                           w ~= self.width or h ~= self.height) then
+                           profile ~= self.profile or w ~= self.width or h ~= self.height) then
             self:reject("missing delta reference", s)
             return
         end
-        self.current = {seq = s, base = base, w = w, h = h, mode = mode,
+        self.current = {profile = profile, seq = s, base = base, w = w, h = h, mode = mode,
                         length = length, checksum = checksum, parts = {}, size = 0}
         return
     end
@@ -170,7 +171,9 @@ function Receiver:process(line)
             self:reject("chunk offset")
             return
         end
-        self.send(string.format("ACK %.0f %d\n", seq, c.size))
+        if c.size % (CHUNK*self.window)==0 or c.size==c.length then
+            self.send(string.format("ACK %.0f %d\n", seq, c.size))
+        end
         return
     end
     seq = tonumber(line:match("^NC2 END (%d+)$"))
@@ -182,6 +185,7 @@ function Receiver:process(line)
         local c = self.current
         if not c or c.seq ~= seq then return end
         if c.size ~= c.length then self:reject("incomplete payload"); return end
+        local decodeStarted = self.clock()
         local payload = M.base64decode(table.concat(c.parts))
         local pixels = payload
         if payload and c.mode == 'P' then pixels = M.paletteUnpack(payload, c.w * c.h)
@@ -191,11 +195,26 @@ function Receiver:process(line)
             self:reject("decode/checksum")
             return
         end
+        if c.profile==16 then
+            for i=1,#pixels do if pixels:byte(i)>15 then self:reject('grayscale index'); return end end
+        end
+        self.decodeMs = self.clock()-decodeStarted
+        self.profile = c.profile
         self.previous, self.lastSequence = pixels, seq
         self.width, self.height, self.current = c.w, c.h, nil
         -- Frame callback also prepares the render cache before granting another frame.
-        self.frame(pixels, c.w, c.h, c.mode, c.length)
+        self.frame(pixels, c.w, c.h, c.mode, c.length, c.profile)
         self.send(string.format("DONE %.0f\n", seq))
+        return
+    end
+    local drop = tonumber(line:match('^NC2 DROP (%d+)$'))
+    if drop then
+        if self.current and self.current.seq==drop then self.current=nil end
+        return
+    end
+    local id, cap, proc, transfer, drops = line:match('^NC2 STATS (%d+) (%d+) (%d+) (%d+) (%d+)$')
+    if id then
+        self.remoteStats = {capture=tonumber(cap), process=tonumber(proc), transfer=tonumber(transfer), dropped=tonumber(drops)}
         return
     end
     if line:match("^NC2 READY ") then self:reset(); self.status(line)

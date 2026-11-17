@@ -68,6 +68,24 @@ int main(int argc, char** argv) {
     assert(!nc2::downsample(edge.data(), edge.size(), 5, 5, 6, out));
     assert(!nc2::downsample(nullptr, 0, 0, 0, 0, out));
 
+    assert(nc2::quantize(255,255,255,16)==15);
+    assert(nc2::quantize(0,0,0,16)==0);
+    auto old=nc2::quantize(85,85,85,64);
+    assert(nc2::filterPixel(131,85,85,64,old,8)==old);
+    assert(nc2::filterPixel(131,85,85,64,old,0)!=old);
+    assert(nc2::filterPixel(255,85,85,64,old,8)!=old);
+    std::ofstream profiles("build/profiles.tsv");
+    uint32_t id=1000;
+    for (unsigned colours:{64,16,256}) {
+        std::vector<uint8_t> prev;
+        for(unsigned round=0;round<3;++round) {
+            std::vector<uint8_t> v(51*51);
+            for(size_t i=0;i<v.size();++i) v[i]=round && i!=37 ? prev[i] : nc2::quantize(random()%256,random()%256,random()%256,colours);
+            auto enc=nc2::encode(v,prev,true);
+            ++id; profiles << id << '\t' << (enc.mode=='D'?id-1:0) << "\t51\t" << enc.mode << '\t' << enc.checksum << '\t' << enc.payload << '\t' << hex(v) << '\t' << colours << '\n';
+            prev=v;
+        }
+    }
     std::ofstream fixture(argv[1]);
     uint32_t seq = 0;
     for (unsigned side : {1, 2, 51, 72, 102}) {

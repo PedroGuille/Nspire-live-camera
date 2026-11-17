@@ -9,7 +9,11 @@ namespace {
 constexpr uint32_t AckTimeoutMs = 1500;
 constexpr unsigned MaxRetries = 3;
 constexpr unsigned KeyframeInterval = 30;
-unsigned side = 72;
+unsigned side = 51, colours = 64, windowChunks = 1, noise = 8;
+bool metrics = false;
+uint32_t frameStarted = 0, captureMs = 0, processMs = 0, droppedFrames = 0;
+unsigned liveFailures = 0;
+uint32_t liveBudget = 0;
 bool streaming = false, snapshot = false, cameraReady = false, flashOn = false;
 bool pending = false, awaitingDone = false;
 uint32_t sequence = 0, previousSequence = 0, sentAt = 0, lastCapture = 0;
@@ -66,17 +70,20 @@ void stopCamera() {
 
 void sendPacket() {
     if (!offset) {
-        Serial.printf("NC2 BEGIN %lu %lu %u %u %c %u %lu\n",
+        Serial.printf("NC2 BEGIN %lu %lu %u %u %c %u %lu %u\n",
             static_cast<unsigned long>(sequence),
             static_cast<unsigned long>(encoded.mode == 'D' ? previousSequence : 0),
             side, side, encoded.mode, static_cast<unsigned>(encoded.payload.size()),
-            static_cast<unsigned long>(encoded.checksum));
+            static_cast<unsigned long>(encoded.checksum), colours);
     }
     if (offset < encoded.payload.size()) {
-        sentLength = std::min(nc2::ChunkChars, encoded.payload.size() - offset);
-        Serial.printf("NC2 DATA %lu %u ", static_cast<unsigned long>(sequence), static_cast<unsigned>(offset));
-        Serial.write(reinterpret_cast<const uint8_t*>(encoded.payload.data() + offset), sentLength);
-        Serial.print('\n');
+        sentLength = std::min(nc2::ChunkChars * windowChunks, encoded.payload.size() - offset);
+        for (size_t i=0; i<sentLength; i+=nc2::ChunkChars) {
+            const size_t n=std::min(nc2::ChunkChars, sentLength-i);
+            Serial.printf("NC2 DATA %lu %u ", static_cast<unsigned long>(sequence), static_cast<unsigned>(offset+i));
+            Serial.write(reinterpret_cast<const uint8_t*>(encoded.payload.data()+offset+i), n);
+            Serial.print('\n');
+        }
     } else {
         awaitingDone = true;
         Serial.printf("NC2 END %lu\n", static_cast<unsigned long>(sequence));
@@ -85,6 +92,7 @@ void sendPacket() {
 }
 
 bool capture() {
+    const uint32_t began=millis();
     if (!initCamera()) return false;
     // Return the queued single buffer first, then acquire a fresh frame. This
     // avoids displaying an image captured before a slow transfer/long pause.
@@ -93,17 +101,21 @@ bool capture() {
     esp_camera_fb_return(fb);
     fb = esp_camera_fb_get();
     if (!fb) return false;
+    captureMs=millis()-began;
+    const uint32_t processing=millis();
     const bool ok = fb->format == PIXFORMAT_RGB565 &&
-        nc2::downsample(fb->buf, fb->len, fb->width, fb->height, side, pixels);
+        nc2::downsample(fb->buf, fb->len, fb->width, fb->height, side, pixels, colours, sinceKeyframe < KeyframeInterval ? &previous : nullptr, noise);
     esp_camera_fb_return(fb); // never hold the camera buffer during serial I/O
     if (!ok) return false;
     encoded = nc2::encode(pixels, previous, sinceKeyframe < KeyframeInterval);
+    processMs=millis()-processing;
     ++sequence;
     if (!sequence) ++sequence; // zero is reserved for 'no reference'
     offset = sentLength = retries = 0;
     awaitingDone = false;
     pending = true;
-    lastCapture = millis();
+    lastCapture = frameStarted = millis();
+    liveBudget = 150 + (encoded.payload.size()*1200UL + 11519)/11520;
     sendPacket();
     return true;
 }
@@ -120,6 +132,11 @@ void handleCommand(const char* command) {
         }
     } else if (sscanf(command, "DONE %lu%n", &seq, &used) == 1 && command[used] == '\0') {
         if (pending && awaitingDone && seq == sequence) {
+            if (metrics) Serial.printf("NC2 STATS %lu %lu %lu %lu %lu\n",
+                static_cast<unsigned long>(sequence), static_cast<unsigned long>(captureMs),
+                static_cast<unsigned long>(processMs), static_cast<unsigned long>(millis()-frameStarted),
+                static_cast<unsigned long>(droppedFrames));
+            liveFailures=0;
             previous.swap(pixels);
             previousSequence = sequence;
             sinceKeyframe = encoded.mode == 'D' ? sinceKeyframe + 1 : 0;
@@ -129,9 +146,18 @@ void handleCommand(const char* command) {
         }
     } else if (sscanf(command, "NAK %lu%n", &seq, &used) == 1 && command[used] == '\0') {
         if (pending && seq == sequence) cancelTransfer();
+    } else if (sscanf(command, "WINDOW %u%n", &next, &used)==1 && command[used]=='\0') {
+        if (next==1 || next==2) { cancelTransfer(); windowChunks=next; }
+    } else if (sscanf(command, "FORMAT %u%n", &next, &used)==1 && command[used]=='\0') {
+        if (next==16 || next==64 || next==256) { cancelTransfer(); colours=next; }
+    } else if (sscanf(command, "NOISE %u%n", &next, &used)==1 && command[used]=='\0') {
+        if (next<=16) { cancelTransfer(); noise=next; }
+    } else if (sscanf(command, "METRICS %u%n", &next, &used)==1 && command[used]=='\0') {
+        metrics=next==1;
     } else if (!strcmp(command, "STREAM")) {
         cancelTransfer();
         streaming = true;
+        liveFailures=0;
         snapshot = false;
     } else if (!strcmp(command, "STOP")) {
         stopCamera();
@@ -187,7 +213,13 @@ void setup() {
 void loop() {
     readCommands(); // STOP/FLASH work even while awaiting an ACK
     if (pending) {
-        if (static_cast<uint32_t>(millis() - sentAt) >= AckTimeoutMs) {
+        if (streaming && (static_cast<uint32_t>(millis()-sentAt)>=180 ||
+                          static_cast<uint32_t>(millis()-frameStarted)>=liveBudget)) {
+            Serial.printf("NC2 DROP %lu\n", static_cast<unsigned long>(sequence));
+            ++droppedFrames;
+            cancelTransfer();
+            if (++liveFailures>=8) { stopCamera(); Serial.println("NC2 ERROR live-link-timeout"); }
+        } else if (!streaming && static_cast<uint32_t>(millis() - sentAt) >= AckTimeoutMs) {
             if (++retries > MaxRetries) {
                 stopCamera();
                 Serial.println("NC2 ERROR ack-timeout");

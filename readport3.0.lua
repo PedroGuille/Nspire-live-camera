@@ -6,11 +6,17 @@ require 'asi'
 local port, receiver
 local frame, runs, frameWidth, frameHeight = nil, {}, 0, 0
 local running, snapshot, readPending = false, false, false
-local selectedSize, status, fps, lastFrameTime = 72, 'Connect the ESP32-CAM adapter', 0, nil
+local selectedSize, status, fps, lastFrameTime = 51, 'Connect the ESP32-CAM adapter', 0, nil
+local selectedFormat, noiseLevel, showTimings = 64, 8, false
+local cacheMs, drawMs, frameProfile = 0, 0, 64
 local palette = {}
+local palettes = {[256]=palette,[64]={},[16]={}}
 for i = 0, 255 do
     palette[i] = {math.floor(math.floor(i / 32) * 255 / 7 + 0.5),
                   math.floor((math.floor(i / 4) % 8) * 255 / 7 + 0.5), (i % 4) * 85}
+    palettes[64][i]={math.floor((math.floor(i/32)*3+3)/7)*85,
+        math.floor(((math.floor(i/4)%8)*3+3)/7)*85,(i%4)*85}
+    if i<16 then palettes[16][i]={i*17,i*17,i*17} end
 end
 
 local function invalidate() platform.window:invalidate() end
@@ -44,7 +50,9 @@ local function onWrite(p, err)
     else table.remove(writes, 1); pumpWrites() end
 end
 
-local function receivedFrame(pixels, w, h, mode, bytes)
+local function receivedFrame(pixels, w, h, mode, bytes, profile)
+    local cacheStarted=timer.getMilliSecCounter()
+    frameProfile=profile or 256
     -- Cache horizontal runs ONCE per complete frame; no per-pixel tables in paint.
     local nextRuns = {}
     for y = 0, h - 1 do
@@ -61,7 +69,8 @@ local function receivedFrame(pixels, w, h, mode, bytes)
     local now = timer.getMilliSecCounter()
     if lastFrameTime and now > lastFrameTime then fps = 1000 / (now - lastFrameTime) end
     lastFrameTime = now
-    status = string.format('%dx%d  RGB332  %s  %d B', w, h, mode, bytes)
+    cacheMs=timer.getMilliSecCounter()-cacheStarted
+    status = string.format('%dx%d  %d levels  %s  %d B', w, h, frameProfile, mode, bytes)
     if snapshot then snapshot = false end
     invalidate()
 end
@@ -71,11 +80,14 @@ receiver = protocol.new(send, receivedFrame, function(message)
     invalidate()
 end)
 
+receiver.window=2
+receiver.clock=timer.getMilliSecCounter
+
 local function requestRead()
     if not port or readPending then return end
     -- One read at a time. Re-arm promptly even when no bytes arrive.
     readPending = true
-    local err = port:read(512)
+    local err = port:read(1024)
     if err then readPending = false; status = 'Serial read: ' .. tostring(err) end
 end
 
@@ -103,6 +115,9 @@ local function start(single)
     receiver:reset()
     running, snapshot = not single, single
     fps, lastFrameTime = 0, nil
+    send('WINDOW 2\n')
+    send('FORMAT '..selectedFormat..'\n')
+    send('NOISE '..noiseLevel..'\n')
     send('SIZE ' .. selectedSize .. '\n')
     send(single and 'PIC\n' or 'STREAM\n')
     status = single and 'Capturing photo...' or 'Starting stream...'
@@ -110,6 +125,19 @@ local function start(single)
     invalidate()
 end
 
+local function chooseFormat(format)
+    selectedFormat=format
+    if running or snapshot then start(snapshot) end
+end
+local function chooseNoise(value)
+    noiseLevel=value
+    if running or snapshot then start(snapshot) end
+end
+local function toggleTimings()
+    showTimings=not showTimings
+    send(showTimings and 'METRICS 1\n' or 'METRICS 0\n')
+    invalidate()
+end
 local function chooseSize(size)
     selectedSize = size
     if running or snapshot then start(snapshot)
@@ -127,6 +155,7 @@ local function connect(p, event)
     port:setReadTimeout(30)
     status = 'Connected. Tab: stream; P: photo; Esc: stop'
     send('HELLO\n')
+    if showTimings then send('METRICS 1\n') end
     requestRead()
     invalidate()
 end
@@ -159,6 +188,7 @@ function on.timer()
 end
 
 function on.paint(gc)
+    local drawStarted=timer.getMilliSecCounter()
     local w, h = platform.window:width(), platform.window:height()
     gc:setColorRGB(0, 0, 0)
     gc:setFont('sansserif', 'r', 8)
@@ -169,7 +199,7 @@ function on.paint(gc)
         local lastColour = -1
         for _, run in ipairs(runs) do
             if run[4] ~= lastColour then
-                local rgb = palette[run[4]]
+                local rgb=palettes[frameProfile][run[4]]
                 gc:setColorRGB(rgb[1], rgb[2], rgb[3])
                 lastColour = run[4]
             end
@@ -183,12 +213,20 @@ function on.paint(gc)
     gc:setColorRGB(0, 0, 0)
     gc:setFont('sansserif', 'r', 7)
     gc:drawString(status, 3, h - 14)
+    if showTimings then
+        local t=receiver.remoteStats or {capture=0,process=0,transfer=0,dropped=0}
+        gc:setColorRGB(255,255,255); gc:fillRect(0,18,w,27); gc:setColorRGB(0,0,0)
+        gc:drawString(string.format('ms capture:%d process:%d wire/ACK:%d',t.capture,t.process,t.transfer),2,18)
+        gc:drawString(string.format('decode:%d cache:%d draw:%d drops:%d',receiver.decodeMs,cacheMs,drawMs,t.dropped),2,31)
+    end
+    drawMs=timer.getMilliSecCounter()-drawStarted
 end
 
 function on.tabKey() start(false) end
 function on.escapeKey() stop() end
 function on.charIn(key)
     if key:lower() == 'p' then start(true)
+    elseif key:lower() == 't' then toggleTimings()
     elseif key:lower() == 'f' then send('FLASH\n') end
 end
 function on.destroy()
@@ -199,6 +237,12 @@ toolpalette.register({
     {'Camera', {'Start stream', function() start(false) end},
                {'Take photo', function() start(true) end},
                {'Stop', stop}, {'Toggle flash', function() send('FLASH\n') end}},
+    {'Colours', {'64 colours (fast default)', function() chooseFormat(64) end},
+                 {'16 shades grayscale', function() chooseFormat(16) end},
+                 {'256 colours', function() chooseFormat(256) end}},
+    {'Noise', {'Low-lag filter', function() chooseNoise(8) end},
+              {'Exact pixels', function() chooseNoise(0) end}},
+    {'Diagnostics', {'Toggle timings (T)', toggleTimings}},
     {'Quality', {'Fast: 51 x 51', function() chooseSize(51) end},
                 {'Balanced: 72 x 72', function() chooseSize(72) end},
                 {'Detail: 102 x 102', function() chooseSize(102) end}}

@@ -89,3 +89,42 @@ assert(count==3)
 r:feed('NC2 READY 2 RGB332 51 72 102\r\n')
 assert(not r.previous and r.lastSequence==0)
 print('Lua protocol tests passed: 200 cross-language decodes, fragmentation, retries, corruption, bounds and recovery')
+-- Reduced-colour C++ frames, grouped ACKs, duplicate bursts, dropped frames,
+-- format changes and timing telemetry. Both endpoints still validate checksums.
+for _, fragment in ipairs({1, 191, 1024}) do
+    local replies, count, expected, profile = {}, 0, nil, nil
+    local tick=0
+    local r=p.new(function(s) replies[#replies+1]=s end,function(pixels,w,h,mode,n,fmt)
+        assert(hex(pixels)==expected and fmt==profile)
+        count=count+1
+    end)
+    r.window=2
+    r.clock=function() tick=tick+3; return tick end
+    for line in io.lines('build/profiles.tsv') do
+        local seq,base,side,mode,checksum,payload,pixels,fmt=line:match('^(%d+)\t(%d+)\t(%d+)\t([KRDP])\t(%d+)\t([^\t]+)\t([^\t]+)\t(%d+)$')
+        expected,profile=pixels,tonumber(fmt)
+        local f={seq=tonumber(seq),base=tonumber(base),side=tonumber(side),mode=mode,checksum=checksum,payload=payload}
+        local lines=packets(f)
+        lines[1]=lines[1]:gsub('\n$', ' '..fmt..'\n')
+        for _,packet in ipairs(lines) do
+            for i=1,#packet,fragment do r:feed(packet:sub(i,i+fragment-1)) end
+        end
+        assert(replies[#replies]=='DONE '..seq..'\n' and r.decodeMs==3)
+    end
+    assert(count==9)
+    r:feed('NC2 STATS 1009 12 7 99 2\n')
+    assert(r.remoteStats.capture==12 and r.remoteStats.transfer==99 and r.remoteStats.dropped==2)
+    r:feed('NC2 BEGIN 2000 0 51 51 K 3468 1 64\n')
+    r:feed('NC2 DATA 2000 0 '..string.rep('A',192)..'\n')
+    local n=#replies
+    r:feed('NC2 DATA 2000 0 '..string.rep('A',192)..'\n')
+    assert(#replies==n) -- wait for second chunk
+    r:feed('NC2 DATA 2000 192 '..string.rep('A',192)..'\n')
+    assert(replies[#replies]=='ACK 2000 384\n')
+    r:feed('NC2 DATA 2000 192 '..string.rep('A',192)..'\n')
+    assert(replies[#replies]=='ACK 2000 384\n')
+    local previous=r.previous
+    r:feed('NC2 DROP 2000\n')
+    assert(not r.current and r.previous==previous)
+end
+print('Low-lag protocol tests passed: reduced-colour profiles, grouped ACK loss, drop recovery and stage timings')

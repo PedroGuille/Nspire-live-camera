@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -138,8 +139,35 @@ inline uint8_t rgb332(unsigned r, unsigned g, unsigned b) {
 
 // ESP32 camera RGB565 is high byte first. Exact box boundaries cover the entire
 // centre crop, including right/bottom remainders at non-divisible resolutions.
+inline uint8_t quantize(unsigned r, unsigned g, unsigned b, unsigned colours) {
+    if (colours == 16) return static_cast<uint8_t>((((77*r + 150*g + 29*b + 128) >> 8)*15 + 127)/255);
+    if (colours == 64) {
+        r = ((r*3+127)/255)*85; g = ((g*3+127)/255)*85; b = ((b*3+127)/255)*85;
+    }
+    return rgb332(r,g,b);
+}
+inline uint8_t filterPixel(unsigned r, unsigned g, unsigned b, unsigned colours,
+                           uint8_t old, unsigned noise) {
+    if (noise) {
+        int pr,pg,pb,hr,hg,hb;
+        if (colours == 16) {
+            pr=pg=pb=old*17; hr=hg=hb=9;
+            const int luma=(77*r+150*g+29*b+128)>>8;
+            if (std::abs(luma-pr)<=int(noise)+hr) return old;
+        } else {
+            pr=((old>>5)*255+3)/7; pg=(((old>>2)&7)*255+3)/7; pb=(old&3)*85;
+            if (colours==64) { pr=(((old>>5)*3+3)/7)*85; pg=(( ((old>>2)&7)*3+3)/7)*85; }
+            hr=hg=colours==64?43:18; hb=43;
+            if (std::abs(int(r)-pr)<=int(noise)+hr && std::abs(int(g)-pg)<=int(noise)+hg &&
+                std::abs(int(b)-pb)<=int(noise)+hb) return old;
+        }
+    }
+    return quantize(r,g,b,colours);
+}
+
 inline bool downsample(const uint8_t* src, size_t length, unsigned width,
-                       unsigned height, unsigned side, std::vector<uint8_t>& out) {
+                       unsigned height, unsigned side, std::vector<uint8_t>& out,
+                       unsigned colours = 256, const std::vector<uint8_t>* reference = nullptr, unsigned noise = 0) {
     const unsigned crop = std::min(width, height);
     if (!src || !width || !height || !side || side > MaxSide || side > crop ||
         width > 4096 || height > 4096 || length < size_t(width) * height * 2) return false;
@@ -161,7 +189,10 @@ inline bool downsample(const uint8_t* src, size_t length, unsigned width,
                 }
             }
             const unsigned n = (bottom - top) * (right - left);
-            out[y * side + x] = rgb332((r + n / 2) / n, (g + n / 2) / n, (b + n / 2) / n);
+            const unsigned rr=(r+n/2)/n, gg=(g+n/2)/n, bb=(b+n/2)/n;
+            const size_t pos=y*side+x;
+            out[pos] = reference && reference->size()==out.size() ?
+                filterPixel(rr,gg,bb,colours,(*reference)[pos],noise) : quantize(rr,gg,bb,colours);
         }
     }
     return true;
