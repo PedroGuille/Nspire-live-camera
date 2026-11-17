@@ -38,11 +38,12 @@ bool connectToWiFi(int maxAttempts = 20) {
 
 // todo
 void sendDiscordImage(const String& base64Image) {
-    return true
+    (void)base64Image; // Optional network upload is not implemented.
 }
 
 void sendDiscordMessage(const char* message) {
-    return true
+    (void)message; // Optional messaging is not implemented.
 }
 
 #endif // DISCORD_CONFIG_H
+
